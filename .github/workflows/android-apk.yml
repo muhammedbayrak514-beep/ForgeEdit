@@ -35,78 +35,87 @@ jobs:
         run: |
           unzip -o forge_edit_github_ready.zip -d source
           PROJECT="$(dirname "$(find source -name pubspec.yaml -print -quit)")"
-          if [ ! -f "$PROJECT/pubspec.yaml" ]; then
-            echo "HATA: pubspec.yaml bulunamadı"
-            exit 1
-          fi
+          test -f "$PROJECT/pubspec.yaml"
           echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
-          echo "Proje: $PROJECT"
 
-      - name: Upgrade Android build versions
+      - name: Fix known Dart compile errors
         shell: bash
         run: |
-          set -e
           python3 - <<'PY'
           import os
-          import re
+          from pathlib import Path
 
-          project = os.environ["PROJECT_DIR"]
-          settings = os.path.join(project, "android", "settings.gradle")
-          wrapper = os.path.join(
-              project, "android", "gradle", "wrapper",
-              "gradle-wrapper.properties"
-          )
+          root = Path(os.environ["PROJECT_DIR"]) / "lib"
 
-          with open(settings, encoding="utf-8") as f:
-              content = f.read()
+          def patch(file, replacements):
+              path = root / file
+              text = path.read_text()
+              for old, new in replacements:
+                  if old not in text:
+                      raise SystemExit(
+                          f"Beklenen kod bulunamadı: {file}: {old!r}"
+                      )
+                  text = text.replace(old, new, 1)
+              path.write_text(text)
+              print("Düzeltildi:", file)
 
-          content, agp_count = re.subn(
-              r'(com\.android\.application"\s+version\s+")([^"]+)(")',
-              r'\g<1>8.11.1\3',
-              content
-          )
-          content, kotlin_count = re.subn(
-              r'(org\.jetbrains\.kotlin\.android"\s+version\s+")([^"]+)(")',
-              r'\g<1>2.2.20\3',
-              content
-          )
+          patch("core/theme/app_theme.dart", [
+              ("cardTheme: CardTheme(", "cardTheme: CardThemeData("),
+          ])
 
-          if agp_count == 0:
-              raise SystemExit(
-                  "Android Gradle Plugin satırı bulunamadı: settings.gradle"
-              )
-          if kotlin_count == 0:
-              raise SystemExit(
-                  "Kotlin sürüm satırı bulunamadı: settings.gradle"
-              )
+          patch("presentation/widgets/editor/preview_panel.dart", [
+              ("                          _TextOverlays(projectId: projectId),\n", ""),
+          ])
 
-          with open(settings, "w", encoding="utf-8") as f:
-              f.write(content)
+          patch("presentation/widgets/editor/tool_panel.dart", [
+              ("Icons.transition", "Icons.swap_horiz"),
+          ])
 
-          with open(wrapper, encoding="utf-8") as f:
-              content = f.read()
+          patch("presentation/widgets/editor/clip_inspector.dart", [
+              (
+                  "final max = clip.sourceDurationMs.toDouble().clamp(1, double.infinity);",
+                  "final max = clip.sourceDurationMs.toDouble().clamp(1.0, double.infinity).toDouble();"
+              ),
+              (
+                  "clip.trimStartMs.toDouble().clamp(0, max)",
+                  "clip.trimStartMs.toDouble().clamp(0.0, max).toDouble()"
+              ),
+              (
+                  "clip.trimEndMs.toDouble().clamp(0, max)",
+                  "clip.trimEndMs.toDouble().clamp(0.0, max).toDouble()"
+              ),
+          ])
 
-          content, gradle_count = re.subn(
-              r'gradle-8\.3-all\.zip',
-              'gradle-8.14.3-all.zip',
-              content
-          )
-
-          if gradle_count == 0 and "gradle-8.14.3-all.zip" not in content:
-              raise SystemExit("Gradle wrapper sürümü güncellenemedi")
-
-          with open(wrapper, "w", encoding="utf-8") as f:
-              f.write(content)
-
-          print("Android Gradle Plugin: 8.11.1")
-          print("Kotlin: 2.2.20")
-          print("Gradle: 8.14.3")
+          patch("data/services/export_service.dart", [
+              (
+                  "        // Guarantee stereo AAC so concat never mixes A/V stream layouts\n"
+                  "        final ensured = await _ensureSegmentHasAudio(\n"
+                  "          segmentPaths[i],\n"
+                  "          durationMs: plan.videoTrack[i].durationMs,\n"
+                  "          settings: settings,\n"
+                  "        );\n"
+                  "        if (!ensured) {\n"
+                  "          await _cleanupPartial(outputPath, workDir);\n"
+                  "          return ExportProgress(\n"
+                  "            phase: ExportPhase.failed,\n"
+                  "            message: 'Segment ses akışı oluşturulamadı',\n"
+                  "            error: segmentPaths[i],\n"
+                  "          );\n"
+                  "        }\n",
+                  ""
+              ),
+          ])
           PY
 
       - name: Install Flutter dependencies
         run: |
           cd "$PROJECT_DIR"
           flutter pub get
+
+      - name: Analyze Dart code
+        run: |
+          cd "$PROJECT_DIR"
+          flutter analyze
 
       - name: Build release APK
         run: |
