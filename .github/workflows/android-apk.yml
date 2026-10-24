@@ -1,0 +1,47 @@
+
+name: Forge Edit APK Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get source
+        uses: actions/checkout@v4
+
+      - name: Extract project
+        run: |
+          unzip forge_edit_github_ready.zip -d source
+          find source -name pubspec.yaml -print
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Build APK
+        run: |
+          PROJECT="$(dirname "$(find source -name pubspec.yaml -print -quit)")"
+          cd "$PROJECT"
+          flutter pub get
+          flutter build apk --release
+
+      - name: Save APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ForgeEdit-APK
+          path: source/**/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
