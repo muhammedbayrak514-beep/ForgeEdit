@@ -30,7 +30,7 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Find and prepare project
+      - name: Extract project
         run: |
           unzip -o forge_edit_github_ready.zip -d source
           PROJECT="$(dirname "$(find source -name pubspec.yaml -print -quit)")"
@@ -39,15 +39,18 @@ jobs:
             exit 1
           fi
           echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
-          echo "Proje klasörü: $PROJECT"
+          echo "Proje: $PROJECT"
 
-      - name: Upgrade Gradle wrapper
+      - name: Upgrade Android build versions
         run: |
           sed -i 's/gradle-8\.3-all.zip/gradle-8.14.3-all.zip/' "$PROJECT_DIR/android/gradle/wrapper/gradle-wrapper.properties"
+          sed -i 's/com.android.application" version "8.1.0"/com.android.application" version "8.11.1"/' "$PROJECT_DIR/android/settings.gradle"
+          echo "Gradle:"
           cat "$PROJECT_DIR/android/gradle/wrapper/gradle-wrapper.properties"
+          echo "Android Gradle Plugin:"
+          grep 'com.android.application' "$PROJECT_DIR/android/settings.gradle"
 
-      - name: Install dependencies
-        working-directory: .
+      - name: Install Flutter dependencies
         run: |
           cd "$PROJECT_DIR"
           flutter pub get
