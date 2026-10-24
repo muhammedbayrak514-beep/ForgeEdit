@@ -1,4 +1,3 @@
-
 name: Forge Edit Android APK
 
 on:
@@ -13,7 +12,7 @@ permissions:
 
 jobs:
   build-apk:
-    name: Build Forge Edit APK
+    name: Prepare, test, and build release APK
     runs-on: ubuntu-latest
 
     steps:
@@ -26,12 +25,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Flutter
+      - name: Set up Flutter stable
         uses: subosito/flutter-action@v2
         with:
           channel: stable
 
-      - name: Locate Flutter project
+      - name: Locate or extract Flutter project
         shell: bash
         run: |
           set -euo pipefail
@@ -44,7 +43,6 @@ jobs:
             PROJECT_DIR="$ROOT/forge_edit"
           else
             ZIP_FILE=""
-
             for candidate in \
               "$ROOT/forge_edit_github_ready.zip" \
               "$ROOT/forge_edit_stage9_final.zip"; do
@@ -59,17 +57,18 @@ jobs:
             fi
 
             if [[ -z "$ZIP_FILE" ]]; then
-              echo "ERROR: Flutter project or project ZIP not found."
+              echo "ERROR: Flutter project ZIP not found." >&2
               exit 1
             fi
 
             EXTRACT_DIR="$ROOT/.ci-build-source"
+            rm -rf "$EXTRACT_DIR"
             mkdir -p "$EXTRACT_DIR"
-            unzip -oq "$ZIP_FILE" -d "$EXTRACT_DIR"
+            unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
 
             PUBSPEC="$(find "$EXTRACT_DIR" -type f -name pubspec.yaml -print -quit)"
             if [[ -z "$PUBSPEC" ]]; then
-              echo "ERROR: pubspec.yaml not found inside ZIP."
+              echo "ERROR: pubspec.yaml not found in ZIP." >&2
               exit 1
             fi
 
@@ -77,9 +76,9 @@ jobs:
           fi
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Project: $PROJECT_DIR"
+          echo "Project path: $PROJECT_DIR"
 
-      - name: Update Android toolchain
+      - name: Fix Android toolchain and known Dart compile errors
         shell: bash
         run: |
           set -euo pipefail
@@ -90,79 +89,308 @@ jobs:
 
           project = Path(os.environ["PROJECT_DIR"])
 
+          def replace_once(path, old, new, label):
+              source = path.read_text(encoding="utf-8")
+              if old in source:
+                  path.write_text(
+                      source.replace(old, new, 1),
+                      encoding="utf-8",
+                  )
+                  print(f"FIXED: {label}")
+              elif new in source:
+                  print(f"OK: {label} already fixed")
+              else:
+                  raise RuntimeError(
+                      f"{label}: expected code not found in {path}"
+                  )
+
+          # Android Gradle Plugin and Kotlin versions.
           settings = project / "android/settings.gradle"
-          if settings.exists():
-              text = settings.read_text()
+          text = settings.read_text(encoding="utf-8")
 
-              text, count_agp = re.subn(
-                  r'(id\s+"com\.android\.application"\s+version\s+")[^"]+(")',
-                  r'\g<1>8.11.1\2',
-                  text,
-                  count=1,
+          text, agp_count = re.subn(
+              r'(id\s+"com\.android\.application"\s+version\s+")[^"]+("\s+apply\s+false)',
+              r'\g<1>8.11.1\2',
+              text,
+              count=1,
+          )
+          text, kotlin_count = re.subn(
+              r'(id\s+"org\.jetbrains\.kotlin\.android"\s+version\s+")[^"]+("\s+apply\s+false)',
+              r'\g<1>2.2.20\2',
+              text,
+              count=1,
+          )
+
+          if not agp_count or not kotlin_count:
+              raise RuntimeError(
+                  "Could not update AGP/Kotlin in android/settings.gradle"
               )
 
-              text, count_kotlin = re.subn(
-                  r'(id\s+"org\.jetbrains\.kotlin\.android"\s+version\s+")[^"]+(")',
-                  r'\g<1>2.2.20\2',
-                  text,
-                  count=1,
-              )
+          settings.write_text(text, encoding="utf-8")
+          print("FIXED: Android Gradle Plugin 8.11.1 / Kotlin 2.2.20")
 
-              if count_agp:
-                  print("Updated Android Gradle Plugin.")
-              if count_kotlin:
-                  print("Updated Kotlin plugin.")
-
-              settings.write_text(text)
-
+          # Gradle wrapper.
           wrapper = project / "android/gradle/wrapper/gradle-wrapper.properties"
-          if wrapper.exists():
-              text = wrapper.read_text()
-              text, count = re.subn(
-                  r'gradle-[0-9.]+-(?:all|bin)\.zip',
-                  'gradle-8.14.3-all.zip',
-                  text,
-                  count=1,
+          text = wrapper.read_text(encoding="utf-8")
+          text, count = re.subn(
+              r'gradle-[0-9.]+-all\.zip',
+              "gradle-8.14.3-all.zip",
+              text,
+              count=1,
+          )
+
+          if not count:
+              raise RuntimeError("Gradle wrapper distribution URL not found.")
+
+          wrapper.write_text(text, encoding="utf-8")
+          print("FIXED: Gradle 8.14.3")
+
+          # Flutter's updated Material API.
+          replace_once(
+              project / "lib/core/theme/app_theme.dart",
+              "cardTheme: CardTheme(",
+              "cardTheme: CardThemeData(",
+              "CardThemeData",
+          )
+
+          # Fix the missing text overlay used by PreviewPanel.
+          preview = project / "lib/presentation/widgets/editor/preview_panel.dart"
+          text = preview.read_text(encoding="utf-8")
+
+          if "class _TextOverlays extends ConsumerWidget" not in text:
+              marker = "class _VideoSurface extends StatelessWidget {"
+
+              if marker not in text:
+                  raise RuntimeError(
+                      "Could not find insertion point in preview_panel.dart"
+                  )
+
+              overlay = '''class _TextOverlays extends ConsumerWidget {
+            final String projectId;
+
+            const _TextOverlays({required this.projectId});
+
+            @override
+            Widget build(BuildContext context, WidgetRef ref) {
+              final project = ref.watch(editorProvider(projectId)).value;
+              final timelineMs =
+                  ref.watch(timelineClockProvider(projectId)).positionMs;
+
+              final overlays = (project?.clips ?? const <ClipModel>[])
+                  .where((clip) =>
+                      clip.type == ClipType.text &&
+                      timelineMs >= clip.timelineStartMs &&
+                      timelineMs < clip.timelineEndMs)
+                  .toList();
+
+              if (overlays.isEmpty) {
+                return const SizedBox.shrink();
+              }
+
+              return Stack(
+                children: overlays.map((clip) {
+                  final x =
+                      (clip.posX * 2 - 1).clamp(-1.0, 1.0).toDouble();
+                  final y =
+                      (clip.posY * 2 - 1).clamp(-1.0, 1.0).toDouble();
+
+                  final alignment = clip.textAlign == 0
+                      ? TextAlign.left
+                      : clip.textAlign == 2
+                          ? TextAlign.right
+                          : TextAlign.center;
+
+                  return Positioned.fill(
+                    child: Align(
+                      alignment: Alignment(x, y),
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Text(
+                          clip.textContent,
+                          textAlign: alignment,
+                          style: TextStyle(
+                            color: Color(clip.textColorArgb),
+                            fontSize:
+                                clip.fontSize.clamp(8.0, 200.0).toDouble(),
+                            shadows: const [
+                              Shadow(
+                                color: Colors.black,
+                                blurRadius: 4,
+                                offset: Offset(1, 1),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  );
+                }).toList(),
+              );
+            }
+          }
+
+          '''
+
+              preview.write_text(
+                  text.replace(marker, overlay + marker, 1),
+                  encoding="utf-8",
               )
-              if count:
-                  wrapper.write_text(text)
-                  print("Updated Gradle wrapper.")
+              print("FIXED: Added _TextOverlays")
+          else:
+              print("OK: _TextOverlays already exists")
 
-          theme = project / "lib/core/theme/app_theme.dart"
-          if theme.exists():
-              text = theme.read_text()
-              text = text.replace(
-                  "cardTheme: CardTheme(",
-                  "cardTheme: CardThemeData(",
-              )
-              theme.write_text(text)
+          # Missing icon in the transition tool.
+          replace_once(
+              project / "lib/presentation/widgets/editor/tool_panel.dart",
+              "Icons.transition",
+              "Icons.swap_horiz",
+              "Transition icon",
+          )
 
-          tool_panel = project / "lib/presentation/widgets/editor/tool_panel.dart"
-          if tool_panel.exists():
-              text = tool_panel.read_text()
-              text = text.replace("Icons.transition", "Icons.swap_horiz")
-              tool_panel.write_text(text)
-
+          # Make slider values explicitly double.
           inspector = project / "lib/presentation/widgets/editor/clip_inspector.dart"
-          if inspector.exists():
-              text = inspector.read_text()
-              text = text.replace(
-                  ".clamp(1, double.infinity)",
-                  ".clamp(1.0, double.infinity).toDouble()",
-              )
-              text = text.replace(".clamp(0, max)", ".clamp(0.0, max).toDouble()")
-              inspector.write_text(text)
 
-          print("Android compatibility patch completed.")
+          replace_once(
+              inspector,
+              "final max = clip.sourceDurationMs.toDouble().clamp(1, double.infinity);",
+              "final max = clip.sourceDurationMs.toDouble().clamp(1.0, double.infinity).toDouble();",
+              "Slider max type",
+          )
+
+          replace_once(
+              inspector,
+              "value: clip.trimStartMs.toDouble().clamp(0, max),",
+              "value: clip.trimStartMs.toDouble().clamp(0.0, max).toDouble(),",
+              "Trim start slider type",
+          )
+
+          replace_once(
+              inspector,
+              "value: clip.trimEndMs.toDouble().clamp(0, max),",
+              "value: clip.trimEndMs.toDouble().clamp(0.0, max).toDouble(),",
+              "Trim end slider type",
+          )
+
+          # Restore the missing audio-check helper used by ExportService.
+          export_file = project / "lib/data/services/export_service.dart"
+          text = export_file.read_text(encoding="utf-8")
+
+          probe_import = (
+              "import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';"
+          )
+          if probe_import not in text:
+              old_import = (
+                  "import 'package:ffmpeg_kit_flutter_new/ffmpeg_session.dart';"
+              )
+              if old_import not in text:
+                  raise RuntimeError(
+                      "Could not find FFmpeg import in export_service.dart"
+                  )
+              text = text.replace(
+                  old_import,
+                  old_import + "\n" + probe_import,
+                  1,
+              )
+
+          text = text.replace(
+              '''final ensured = await _ensureSegmentHasAudio(
+                    segmentPaths[i],
+                    durationMs: plan.videoTrack[i].durationMs,
+                    settings: settings,
+                  );''',
+              '''final ensured = await _ensureSegmentHasAudio(
+                    segmentPaths[i],
+                    durationMs: plan.videoTrack[i].durationMs,
+                  );''',
+              1,
+          )
+
+          text = text.replace(
+              'durationMs: plan.videoTrack[i].durationMs,\n          settings: settings,\n        );',
+              'durationMs: plan.videoTrack[i].durationMs,\n        );',
+              1,
+          )
+
+          if "Future<bool> _ensureSegmentHasAudio(" not in text:
+              marker = "  Future<void> _cleanupPartial("
+              if marker not in text:
+                  raise RuntimeError(
+                      "Could not find helper insertion point in export_service.dart"
+                  )
+
+              helper = '''  Future<bool> _ensureSegmentHasAudio(
+              String segmentPath, {
+              required int durationMs,
+            }) async {
+              try {
+                final probeSession =
+                    await FFprobeKit.getMediaInformation(segmentPath);
+                final information =
+                    await probeSession.getMediaInformation();
+
+                if (information == null) return false;
+
+                final hasAudio = information
+                    .getStreams()
+                    .any((stream) => stream.getType() == 'audio');
+
+                if (hasAudio) return true;
+
+                final durationSec = (durationMs / 1000.0)
+                    .clamp(0.1, 3600.0)
+                    .toStringAsFixed(3);
+
+                final fixedPath = segmentPath.replaceFirst(
+                  RegExp(r'\\.mp4$', caseSensitive: false),
+                  '_audiofix.mp4',
+                );
+
+                final command =
+                    '-i "$segmentPath" '
+                    '-f lavfi -t $durationSec '
+                    '-i anullsrc=channel_layout=stereo:sample_rate=44100 '
+                    '-map 0:v:0 -map 1:a:0 '
+                    '-c:v copy -c:a aac -b:a 128k '
+                    '-ar 44100 -ac 2 -t $durationSec -y "$fixedPath"';
+
+                final ok = await _runAsync(command);
+                final fixedFile = File(fixedPath);
+
+                if (!ok ||
+                    !await fixedFile.exists() ||
+                    await fixedFile.length() == 0) {
+                  if (await fixedFile.exists()) {
+                    await fixedFile.delete();
+                  }
+                  return false;
+                }
+
+                await fixedFile.copy(segmentPath);
+                await fixedFile.delete();
+                return true;
+              } catch (error) {
+                print('Segment audio check failed: $error');
+                return false;
+              }
+            }
+
+          '''
+
+              text = text.replace(marker, helper + marker, 1)
+              print("FIXED: Added _ensureSegmentHasAudio")
+          else:
+              print("OK: _ensureSegmentHasAudio already exists")
+
+          export_file.write_text(text, encoding="utf-8")
           PY
 
-      - name: Install dependencies
+      - name: Download Flutter dependencies
         run: |
           cd "$PROJECT_DIR"
           flutter --version
           flutter pub get
 
-      - name: Analyze Dart code
+      - name: Run Dart analyzer
         continue-on-error: true
         run: |
           cd "$PROJECT_DIR"
@@ -179,7 +407,7 @@ jobs:
           cd "$PROJECT_DIR"
           flutter build apk --release
 
-      - name: Upload APK
+      - name: Upload release APK
         uses: actions/upload-artifact@v4
         with:
           name: forge-edit-release-apk
